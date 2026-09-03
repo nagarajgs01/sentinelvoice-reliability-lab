@@ -1,0 +1,19 @@
+Metadata-Version: 2.4
+Name: sentinelvoice
+Version: 0.1.0
+Summary: Local-first Voice AI SRE for GPU inference infrastructure
+Requires-Python: >=3.11
+Requires-Dist: fastapi<1,>=0.115
+Requires-Dist: uvicorn[standard]<1,>=0.30
+Requires-Dist: pydantic<3,>=2.8
+Requires-Dist: httpx<1,>=0.27
+Requires-Dist: numpy<3,>=1.26
+Provides-Extra: voice
+Requires-Dist: faster-whisper<2,>=1.1; extra == "voice"
+Requires-Dist: silero-vad<7,>=5.1; extra == "voice"
+Requires-Dist: soundfile<1,>=0.12; extra == "voice"
+Requires-Dist: kokoro<1,>=0.9.4; extra == "voice"
+Requires-Dist: misaki[en]<1,>=0.9; extra == "voice"
+Provides-Extra: dev
+Requires-Dist: pytest<9,>=8; extra == "dev"
+Requires-Dist: pytest-asyncio<1,>=0.24; extra == "dev"
