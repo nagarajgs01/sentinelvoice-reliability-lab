@@ -1,23 +1,30 @@
-from fastapi import FastAPI, HTTPException, Request
+from __future__ import annotations
+
+import base64
+from time import perf_counter
+
+import httpx
+
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
-import json
-from time import perf_counter
-
-from .agent import OllamaAgent, OllamaTimeoutError
-from .simulator import simulator
-from .domain import Evidence, ToolCall
+from .benchmark import (
+    LLM_MODELS,
+    STT_MODELS,
+    TTS_CONFIGS,
+    benchmark_transcript,
+    keyword_coverage,
+    real_time_factor,
+)
 from .evaluation import evaluate_trace
-from .remediation import RemediationError, RemediationManager
-from .tools import ClusterTools
-from .transcription import transcriber
+from .transcription import transcribers
 from .tts import speech_service
 from .tracing import traces
+from .ollama import ollama_service
 
-
-app = FastAPI(title="SentinelVoice API", version="0.1.0")
+app = FastAPI(title="SentinelVoice Lab API", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
@@ -26,94 +33,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-tools = ClusterTools(simulator)
-agent = OllamaAgent()
-remediation = RemediationManager(simulator)
-MAX_INVESTIGATION_STEPS = 4
-
 
 def request_trace_id(request: Request) -> str:
     return traces.ensure(request.headers.get("x-trace-id"))
 
 
-def execute_tool_traced(trace_id: str, call: ToolCall) -> Evidence:
-    started = perf_counter()
-    try:
-        result = tools.execute(call.name, call.arguments)
-    except Exception:
-        traces.record(
-            trace_id,
-            "tool",
-            "tool_call",
-            duration_ms=(perf_counter() - started) * 1000,
-            status="error",
-            metadata={"tool": call.name, "arguments": call.arguments},
-        )
-        raise
-    traces.record(
-        trace_id,
-        "tool",
-        "tool_call",
-        duration_ms=(perf_counter() - started) * 1000,
-        metadata={"tool": call.name, "arguments": call.arguments, "source": result.source},
-    )
-    return result
-
-
-def call_signature(call: ToolCall) -> str:
-    normalized_name = call.name.strip()
-    if normalized_name.endswith("()"):
-        normalized_name = normalized_name[:-2]
-    return json.dumps(
-        {"name": normalized_name, "arguments": call.arguments},
-        sort_keys=True,
-    )
-
-
-def required_baseline_calls(transcript: str) -> list[ToolCall]:
-    """Require core telemetry for broad incident and latency investigations."""
-    investigation_terms = (
-        "investigate",
-        "incident",
-        "latency",
-        "root cause",
-        "slow",
-        "queue",
-        "error rate",
-    )
-    if any(term in transcript.lower() for term in investigation_terms):
-        return [
-            ToolCall(name="get_cluster_summary"),
-            ToolCall(name="get_inference_metrics"),
-        ]
-    return []
-
-
-def missing_unhealthy_node_calls(evidence: list[Evidence]) -> list[ToolCall]:
-    """Inspect each unhealthy node discovered by cluster-summary evidence."""
-    unhealthy_nodes: set[str] = set()
-    inspected_nodes: set[str] = set()
-
-    for item in evidence:
-        if item.source == "cluster_summary":
-            unhealthy_nodes.update(item.data.get("unhealthy_nodes", []))
-        elif item.source == "node_health" and item.data.get("id"):
-            inspected_nodes.add(item.data["id"])
-
-    return [
-        ToolCall(name="get_node_health", arguments={"node_id": node_id})
-        for node_id in sorted(unhealthy_nodes - inspected_nodes)
-    ]
-
-
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "product": "SentinelVoice Lab"}
 
 
-@app.get("/api/cluster")
-def cluster():
-    return simulator.snapshot()
+@app.get("/api/models")
+def models():
+    return {"stt": STT_MODELS, "llm": LLM_MODELS, "tts": TTS_CONFIGS}
 
 
 @app.get("/api/traces/{trace_id}")
@@ -135,7 +67,7 @@ def get_trace_evaluation(trace_id: str):
 @app.post("/api/traces/{trace_id}/events")
 def record_client_trace_event(trace_id: str, payload: dict):
     trace_id = traces.ensure(trace_id)
-    event = traces.record(
+    return traces.record(
         trace_id,
         str(payload.get("component", "client"))[:40],
         str(payload.get("name", "event"))[:80],
@@ -143,208 +75,149 @@ def record_client_trace_event(trace_id: str, payload: dict):
         status=str(payload.get("status", "ok"))[:20],
         metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
     )
-    return event
 
 
-@app.post("/api/scenarios/{scenario}")
-def inject_scenario(scenario: str):
-    if scenario == "thermal_failure":
-        return simulator.inject_thermal_failure()
-    if scenario == "traffic_spike":
-        return simulator.inject_traffic_spike()
-    if scenario == "reset":
-        return simulator.reset()
-    raise HTTPException(status_code=404, detail=f"Unknown scenario: {scenario}")
-
-
-@app.post("/api/agent/message")
-async def message(payload: dict[str, str], request: Request):
-    trace_id = request_trace_id(request)
-    turn_started = perf_counter()
-    traces.record(trace_id, "orchestrator", "turn_started")
-    transcript = payload.get("text", "").strip()
-    if not transcript:
-        raise HTTPException(status_code=400, detail="text is required")
-    evidence = []
-    executed_calls: set[str] = set()
-
-    for call in required_baseline_calls(transcript):
-        executed_calls.add(call_signature(call))
-        evidence.append(execute_tool_traced(trace_id, call))
-
-    for _ in range(MAX_INVESTIGATION_STEPS):
-        llm_started = perf_counter()
-        try:
-            decision = await agent.decide(transcript, evidence)
-        except OllamaTimeoutError as error:
-            traces.record(trace_id, "llm", "decision", duration_ms=(perf_counter() - llm_started) * 1000, status="timeout")
-            raise HTTPException(status_code=504, detail=str(error)) from error
-        traces.record(
-            trace_id,
-            "llm",
-            "decision",
-            duration_ms=(perf_counter() - llm_started) * 1000,
-            metadata={"tool_calls_requested": len(decision.tool_calls)},
-        )
-        if not decision.tool_calls:
-            required_node_calls = missing_unhealthy_node_calls(evidence)
-            if not required_node_calls:
-                break
-            for call in required_node_calls:
-                executed_calls.add(call_signature(call))
-                evidence.append(execute_tool_traced(trace_id, call))
-            continue
-
-        new_calls = []
-        for call in decision.tool_calls:
-            signature = call_signature(call)
-            if signature not in executed_calls:
-                executed_calls.add(signature)
-                new_calls.append(call)
-
-        if not new_calls:
-            llm_started = perf_counter()
-            try:
-                decision = await agent.decide(transcript, evidence, allow_tools=False)
-            except OllamaTimeoutError as error:
-                raise HTTPException(status_code=504, detail=str(error)) from error
-            traces.record(trace_id, "llm", "final_decision", duration_ms=(perf_counter() - llm_started) * 1000)
-            break
-
-        for call in new_calls:
-            try:
-                evidence.append(execute_tool_traced(trace_id, call))
-            except (TypeError, ValueError) as error:
-                raise HTTPException(status_code=400, detail=str(error)) from error
-    else:
-        llm_started = perf_counter()
-        try:
-            decision = await agent.decide(transcript, evidence, allow_tools=False)
-        except OllamaTimeoutError as error:
-            raise HTTPException(status_code=504, detail=str(error)) from error
-        traces.record(trace_id, "llm", "final_decision", duration_ms=(perf_counter() - llm_started) * 1000)
-
-    traces.record(
-        trace_id,
-        "orchestrator",
-        "turn_completed",
-        duration_ms=(perf_counter() - turn_started) * 1000,
-        metadata={"evidence_count": len(evidence)},
-    )
-
-    return {
-        "decision": decision,
-        "evidence": evidence,
-        "recommendations": remediation.options(),
-        "trace_id": trace_id,
-    }
-
-
-@app.get("/api/remediation/options")
-def remediation_options():
-    return remediation.options()
-
-
-@app.post("/api/remediation/prepare")
-def prepare_remediation(payload: dict[str, str]):
-    action_id = payload.get("action_id", "").strip()
-    try:
-        return remediation.prepare(action_id)
-    except RemediationError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-
-
-@app.post("/api/remediation/confirm")
-def confirm_remediation(payload: dict[str, str]):
-    action_id = payload.get("action_id", "").strip()
-    token = payload.get("confirmation_token", "").strip()
-    try:
-        result = remediation.confirm(action_id, token)
-    except RemediationError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    return {"result": result, "cluster": simulator.snapshot()}
-
-
-@app.post("/api/remediation/voice-confirm")
-def voice_confirm_remediation(payload: dict[str, str]):
-    action_id = payload.get("action_id", "").strip()
-    token = payload.get("confirmation_token", "").strip()
-    phrase = payload.get("phrase", "").strip()
-    try:
-        result = remediation.confirm_by_phrase(action_id, token, phrase)
-    except RemediationError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    return {"result": result, "cluster": simulator.snapshot()}
-
-
-@app.post("/api/remediation/cancel")
-def cancel_remediation(payload: dict[str, str]):
-    token = payload.get("confirmation_token", "").strip()
-    try:
-        remediation.cancel(token)
-    except RemediationError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    return {"status": "cancelled"}
-
-
-@app.post("/api/voice/transcribe")
-async def transcribe_audio(request: Request):
-    trace_id = request_trace_id(request)
+@app.post("/api/benchmarks/stt")
+async def benchmark_stt(
+    request: Request,
+    model: str = Query(...),
+    expected_text: str = Query(..., min_length=1),
+):
+    if model not in {item["id"] for item in STT_MODELS}:
+        raise HTTPException(status_code=404, detail=f"Unknown STT model: {model}")
     audio = await request.body()
     if not audio:
         raise HTTPException(status_code=400, detail="Audio payload is empty")
-
-    content_type = request.headers.get("content-type", "audio/webm")
-    suffixes = {
-        "audio/webm": ".webm",
-        "audio/mp4": ".mp4",
-        "audio/wav": ".wav",
-        "audio/x-wav": ".wav",
-    }
-    suffix = suffixes.get(content_type.split(";", 1)[0], ".webm")
+    content_type = request.headers.get("content-type", "audio/webm").split(";", 1)[0]
+    suffix = {"audio/webm": ".webm", "audio/mp4": ".mp4", "audio/wav": ".wav", "audio/x-wav": ".wav"}.get(content_type, ".webm")
+    trace_id = request_trace_id(request)
     started = perf_counter()
-    try:
-        result = transcriber.transcribe_bytes(audio, suffix=suffix)
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+    result = await run_in_threadpool(transcribers.transcribe_bytes, model, audio, suffix)
+    latency_ms = (perf_counter() - started) * 1000
     traces.record(
-        trace_id,
-        "stt",
-        "transcription",
-        duration_ms=(perf_counter() - started) * 1000,
-        metadata={"audio_bytes": len(audio), "language": result.get("language")},
+        trace_id, "stt", "transcription", duration_ms=latency_ms,
+        metadata={"model": model, "audio_bytes": len(audio)},
     )
-    return {**result, "trace_id": trace_id}
+    return {
+        **benchmark_transcript(expected_text, str(result["text"]), latency_ms),
+        **result, "model": model, "trace_id": trace_id,
+    }
 
 
 @app.post("/api/voice/speak")
 async def synthesize_speech(payload: dict[str, str], request: Request):
     trace_id = request_trace_id(request)
-    text = payload.get("text", "")
     try:
         audio, generation_seconds, audio_seconds = await run_in_threadpool(
-            speech_service.synthesize,
-            text,
+            speech_service.synthesize, payload.get("text", ""), payload.get("voice")
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     except RuntimeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
-
     traces.record(
-        trace_id,
-        "tts",
-        "speech_generation",
-        duration_ms=generation_seconds * 1000,
-        metadata={"audio_duration_seconds": round(audio_seconds, 3), "characters": len(text)},
+        trace_id, "tts", "speech_generation", duration_ms=generation_seconds * 1000,
+        metadata={"audio_duration_seconds": round(audio_seconds, 3)},
     )
+    return Response(content=audio, media_type="audio/wav", headers={"X-Trace-ID": trace_id})
 
-    return Response(
-        content=audio,
-        media_type="audio/wav",
-        headers={
-            "X-TTS-Generation-Seconds": f"{generation_seconds:.3f}",
-            "X-Audio-Duration-Seconds": f"{audio_seconds:.3f}",
-            "X-Trace-ID": trace_id,
-        },
+
+@app.post("/api/benchmarks/tts")
+async def benchmark_tts(payload: dict, request: Request):
+    text = str(payload.get("text", "")).strip()
+    voice = str(payload.get("voice", ""))
+    stt_model = str(payload.get("stt_model", "tiny.en"))
+    if voice not in {item["id"] for item in TTS_CONFIGS}:
+        raise HTTPException(status_code=404, detail=f"Unknown TTS voice: {voice}")
+    if stt_model not in {item["id"] for item in STT_MODELS}:
+        raise HTTPException(status_code=404, detail=f"Unknown STT model: {stt_model}")
+    trace_id = request_trace_id(request)
+    try:
+        audio, generation_seconds, audio_seconds = await run_in_threadpool(
+            speech_service.synthesize, text, voice
+        )
+        transcription = await run_in_threadpool(
+            transcribers.transcribe_bytes, stt_model, audio, ".wav"
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    quality = benchmark_transcript(text, str(transcription["text"]), generation_seconds * 1000)
+    traces.record(trace_id, "tts", "speech_generation", duration_ms=generation_seconds * 1000,
+                  metadata={"voice": voice, "audio_duration_seconds": audio_seconds})
+    return {
+        "voice": voice,
+        "text": text,
+        "round_trip_transcript": transcription["text"],
+        "intelligibility_percent": quality["accuracy_percent"],
+        "word_error_rate": quality["word_error_rate"],
+        "generation_ms": round(generation_seconds * 1000, 2),
+        "audio_seconds": round(audio_seconds, 3),
+        "real_time_factor": round(real_time_factor(generation_seconds, audio_seconds), 3),
+        "audio_base64": base64.b64encode(audio).decode("ascii"),
+        "trace_id": trace_id,
+    }
+
+
+@app.post("/api/benchmarks/llm")
+async def benchmark_llm(payload: dict, request: Request):
+    model = str(payload.get("model", ""))
+    prompt = str(payload.get("prompt", ""))
+    keywords = [str(item) for item in payload.get("expected_keywords", [])]
+    if model not in {item["id"] for item in LLM_MODELS}:
+        raise HTTPException(status_code=404, detail=f"Unknown LLM model: {model}")
+    trace_id = request_trace_id(request)
+    try:
+        response, duration = await ollama_service.complete(model, prompt)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except (httpx.HTTPError, KeyError) as error:
+        raise HTTPException(status_code=503, detail=f"Ollama request failed: {error}") from error
+    coverage = keyword_coverage(keywords, response)
+    traces.record(trace_id, "llm", "completion", duration_ms=duration * 1000,
+                  metadata={"model": model, "keyword_coverage": coverage})
+    return {"model": model, "response": response, "latency_ms": round(duration * 1000, 2),
+            "keyword_coverage_percent": round(coverage * 100, 2), "passed": coverage >= 0.8,
+            "trace_id": trace_id}
+
+
+@app.post("/api/benchmarks/pipeline")
+async def benchmark_pipeline(
+    request: Request,
+    stt_model: str = Query(...),
+    llm_model: str = Query(...),
+    tts_voice: str = Query(...),
+    expected_transcript: str = Query(..., min_length=1),
+):
+    if stt_model not in {item["id"] for item in STT_MODELS}:
+        raise HTTPException(status_code=404, detail=f"Unknown STT model: {stt_model}")
+    if llm_model not in {item["id"] for item in LLM_MODELS}:
+        raise HTTPException(status_code=404, detail=f"Unknown LLM model: {llm_model}")
+    if tts_voice not in {item["id"] for item in TTS_CONFIGS}:
+        raise HTTPException(status_code=404, detail=f"Unknown TTS voice: {tts_voice}")
+    source_audio = await request.body()
+    if not source_audio:
+        raise HTTPException(status_code=400, detail="Audio payload is empty")
+    trace_id = request_trace_id(request)
+    content_type = request.headers.get("content-type", "audio/webm").split(";", 1)[0]
+    suffix = {"audio/mp4": ".mp4", "audio/wav": ".wav", "audio/x-wav": ".wav"}.get(content_type, ".webm")
+    stt_started = perf_counter()
+    transcript = await run_in_threadpool(transcribers.transcribe_bytes, stt_model, source_audio, suffix)
+    stt_ms = (perf_counter() - stt_started) * 1000
+    response, llm_seconds = await ollama_service.complete(llm_model, str(transcript["text"]))
+    response_audio, tts_seconds, audio_seconds = await run_in_threadpool(
+        speech_service.synthesize, response, tts_voice
     )
+    transcript_quality = benchmark_transcript(expected_transcript, str(transcript["text"]), stt_ms)
+    traces.record(trace_id, "stt", "transcription", duration_ms=stt_ms, metadata={"model": stt_model})
+    traces.record(trace_id, "llm", "completion", duration_ms=llm_seconds * 1000, metadata={"model": llm_model})
+    traces.record(trace_id, "tts", "speech_generation", duration_ms=tts_seconds * 1000, metadata={"voice": tts_voice})
+    return {
+        "configuration": {"stt": stt_model, "llm": llm_model, "tts": tts_voice},
+        "transcript": transcript["text"], "response": response,
+        "stt_accuracy_percent": transcript_quality["accuracy_percent"],
+        "stt_ms": round(stt_ms, 2), "llm_ms": round(llm_seconds * 1000, 2),
+        "tts_ms": round(tts_seconds * 1000, 2),
+        "total_ms": round(stt_ms + llm_seconds * 1000 + tts_seconds * 1000, 2),
+        "response_audio_seconds": round(audio_seconds, 3),
+        "audio_base64": base64.b64encode(response_audio).decode("ascii"), "trace_id": trace_id,
+    }

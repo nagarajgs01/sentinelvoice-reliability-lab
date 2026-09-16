@@ -4,56 +4,36 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from threading import Lock
 
-from .config import settings
 
-
-class WhisperTranscriber:
-    """Lazy, process-wide Faster Whisper adapter for uploaded audio."""
+class WhisperRegistry:
+    """Lazy cache of selectable Faster Whisper models."""
 
     def __init__(self) -> None:
-        self._model = None
+        self._models: dict[str, object] = {}
         self._lock = Lock()
 
-    def _get_model(self):
-        if self._model is None:
+    def _get_model(self, model_name: str):
+        if model_name not in self._models:
             with self._lock:
-                if self._model is None:
+                if model_name not in self._models:
                     from faster_whisper import WhisperModel
+                    self._models[model_name] = WhisperModel(model_name, device="cpu", compute_type="int8")
+        return self._models[model_name]
 
-                    self._model = WhisperModel(
-                        settings.whisper_model,
-                        device="cpu",
-                        compute_type="int8",
-                    )
-        return self._model
-
-    def transcribe_bytes(self, audio: bytes, suffix: str = ".webm") -> dict[str, object]:
+    def transcribe_bytes(self, model_name: str, audio: bytes, suffix: str = ".webm") -> dict[str, object]:
         if not audio:
             raise ValueError("Audio payload is empty")
-
         path: Path | None = None
         try:
             with NamedTemporaryFile(suffix=suffix, delete=False) as temporary:
                 temporary.write(audio)
                 path = Path(temporary.name)
-
-            segments, info = self._get_model().transcribe(
-                str(path),
-                beam_size=1,
-                vad_filter=True,
-            )
-            materialized = list(segments)
-            text = " ".join(segment.text.strip() for segment in materialized).strip()
-            return {
-                "text": text,
-                "language": info.language,
-                "language_probability": round(info.language_probability, 4),
-                "duration_seconds": round(info.duration, 3),
-            }
+            segments, info = self._get_model(model_name).transcribe(str(path), beam_size=1, vad_filter=True)
+            text = " ".join(segment.text.strip() for segment in segments).strip()
+            return {"text": text, "language": info.language, "duration_seconds": round(info.duration, 3)}
         finally:
             if path is not None:
                 path.unlink(missing_ok=True)
 
 
-transcriber = WhisperTranscriber()
-
+transcribers = WhisperRegistry()

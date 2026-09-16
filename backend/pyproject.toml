@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sentinelvoice"
-version = "0.1.0"
-description = "Local-first Voice AI SRE for GPU inference infrastructure"
+version = "1.0.0"
+description = "Local-first Voice AI model benchmarking and reliability lab"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115,<1",

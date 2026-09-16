@@ -1,7 +1,7 @@
 Metadata-Version: 2.4
 Name: sentinelvoice
-Version: 0.1.0
-Summary: Local-first Voice AI SRE for GPU inference infrastructure
+Version: 1.0.0
+Summary: Local-first Voice AI model benchmarking and reliability lab
 Requires-Python: >=3.11
 Requires-Dist: fastapi<1,>=0.115
 Requires-Dist: uvicorn[standard]<1,>=0.30

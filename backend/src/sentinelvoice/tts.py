@@ -30,7 +30,7 @@ class KokoroSpeechService:
                     self._pipeline = KPipeline(lang_code="a")
         return self._pipeline
 
-    def synthesize(self, text: str) -> tuple[bytes, float, float]:
+    def synthesize(self, text: str, voice: str | None = None) -> tuple[bytes, float, float]:
         cleaned = " ".join(text.strip().split())
         if not cleaned:
             raise ValueError("Speech text is empty")
@@ -45,7 +45,7 @@ class KokoroSpeechService:
                 np.asarray(audio, dtype=np.float32)
                 for _, _, audio in self._get_pipeline()(
                     cleaned,
-                    voice=settings.kokoro_voice,
+                    voice=voice or settings.kokoro_voice,
                     speed=1.05,
                 )
             ]
